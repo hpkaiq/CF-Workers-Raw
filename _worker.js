@@ -1,4 +1,5 @@
 let token = "";
+
 const PREFIX = '/gp/'
 // 分支文件使用jsDelivr镜像的开关，0为关闭，默认关闭
 const Config = {
