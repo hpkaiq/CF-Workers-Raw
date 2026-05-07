@@ -30,7 +30,7 @@ export default {
     async fetch(request, env) {
         const url = new URL(request.url);
         if (url.pathname.startsWith(PREFIX)) {
-            return fetchHandler(request).catch(err => makeRes('cfworker error:\n' + err.stack, 502))
+            return fetchHandler(request, env).catch(err => makeRes('cfworker error:\n' + err.stack, 502))
         } else if (url.pathname !== '/') {
             let path_auth = false
             if (url.pathname.startsWith('/' + env.TOKEN)) {
@@ -222,7 +222,7 @@ function checkUrl(u) {
 /**
  * @param {FetchEvent} e
  */
-async function fetchHandler(req) {
+async function fetchHandler(req, env) {
     const urlStr = req.url
     const urlObj = new URL(urlStr)
     let path = urlObj.searchParams.get('q')
@@ -232,14 +232,14 @@ async function fetchHandler(req) {
     // cfworker 会把路径中的 `//` 合并成 `/`
     path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
     if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0 || path.search(exp4) === 0 || path.search(exp7) === 0) {
-        return httpHandler(req, path)
+        return httpHandler(req, path, env)
     } else if (path.search(exp2) === 0) {
         if (Config.jsdelivr) {
             const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
             return Response.redirect(newUrl, 302)
         } else {
             path = path.replace('/blob/', '/raw/')
-            return httpHandler(req, path)
+            return httpHandler(req, path, env)
         }
     } else if (path.search(exp4) === 0) {
         const newUrl = path.replace(/(?<=com\/.+?\/.+?)\/(.+?\/)/, '@$1').replace(/^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com/, 'https://cdn.jsdelivr.net/gh')
@@ -252,7 +252,7 @@ async function fetchHandler(req) {
  * @param {Request} req
  * @param {string} pathname
  */
-function httpHandler(req, pathname) {
+function httpHandler(req, pathname, env) {
     const reqHdrRaw = req.headers
 
     // preflight
@@ -279,6 +279,14 @@ function httpHandler(req, pathname) {
         urlStr = 'https://' + urlStr
     }
     const urlObj = newUrl(urlStr)
+
+    // 当目标为 api.github.com 时，自动注入 Authorization token
+    if (env && urlObj && urlObj.hostname === 'api.github.com' && !reqHdrNew.has('authorization')) {
+        const githubToken = urlObj.searchParams.get('token') || env.GH_TOKEN || env.TOKEN || '';
+        if (githubToken) {
+            reqHdrNew.set('Authorization', `token ${githubToken}`)
+        }
+    }
 
     /** @type {RequestInit} */
     const reqInit = {
