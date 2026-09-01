@@ -1,6 +1,9 @@
 let token = "";
 
 const PREFIX = '/gp/'
+const DEFAULT_DOCKER_PREFIX = '/dp/'
+let hub_host = 'registry-1.docker.io'
+const auth_url = 'https://auth.docker.io'
 // 分支文件使用jsDelivr镜像的开关，0为关闭，默认关闭
 const Config = {
     jsdelivr: 0
@@ -29,6 +32,10 @@ const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
+        const dockerPrefix = getDockerPrefix(env);
+        if (url.pathname === dockerPrefix.slice(0, -1) || url.pathname.startsWith(dockerPrefix)) {
+            return dockerFetchHandler(request, env, dockerPrefix).catch(err => makeRes('docker worker error:\n' + err.stack, 502))
+        }
         if (url.pathname.startsWith(PREFIX)) {
             return fetchHandler(request, env).catch(err => makeRes('cfworker error:\n' + err.stack, 502))
         } else if (url.pathname !== '/') {
@@ -185,6 +192,228 @@ async function ADD(envadd) {
     const add = addtext.split(',');
     //console.log(add);
     return add;
+}
+
+function getDockerPrefix(env) {
+    let prefix = env && env.DOCKER_PREFIX ? String(env.DOCKER_PREFIX).trim() : DEFAULT_DOCKER_PREFIX;
+    if (!prefix.startsWith('/')) prefix = '/' + prefix;
+    if (!prefix.endsWith('/')) prefix += '/';
+    return prefix;
+}
+
+function routeByDockerHosts(host) {
+    const routes = {
+        quay: 'quay.io',
+        gcr: 'gcr.io',
+        'k8s-gcr': 'k8s.gcr.io',
+        k8s: 'registry.k8s.io',
+        ghcr: 'ghcr.io',
+        cloudsmith: 'docker.cloudsmith.io',
+        nvcr: 'nvcr.io',
+        test: 'registry-1.docker.io',
+    };
+
+    if (host in routes) return [routes[host], false];
+    return [hub_host, true];
+}
+
+async function dockerFetchHandler(request, env, dockerPrefix) {
+    const getReqHeader = key => request.headers.get(key);
+    const originalUrl = new URL(request.url);
+    const prefixBase = dockerPrefix.slice(0, -1);
+    const workers_url = `${originalUrl.origin}${prefixBase}`;
+
+    let url = new URL(request.url);
+    if (url.pathname === prefixBase) {
+        url.pathname = '/';
+    } else if (url.pathname.startsWith(dockerPrefix)) {
+        url.pathname = '/' + url.pathname.slice(dockerPrefix.length);
+    }
+
+    const ns = url.searchParams.get('ns');
+    const hostname = url.searchParams.get('hubhost') || originalUrl.hostname;
+    const hostTop = hostname.split('.')[0];
+
+    let checkHost;
+    if (ns) {
+        hub_host = ns === 'docker.io' ? 'registry-1.docker.io' : ns;
+    } else {
+        checkHost = routeByDockerHosts(hostTop);
+        hub_host = checkHost[0];
+    }
+
+    url.hostname = hub_host;
+    if (url.pathname === '/' || url.pathname.startsWith('/v1/')) {
+        return new Response('Docker registry proxy only', { status: 404 });
+    }
+
+    if (!/%2F/.test(url.search) && /%3A/.test(url.toString())) {
+        url = new URL(url.toString().replace(/%3A(?=.*?&)/, '%3Alibrary%2F'));
+    }
+
+    if (url.pathname.includes('/token')) {
+        const token_parameter = {
+            headers: {
+                Host: 'auth.docker.io',
+                'User-Agent': getReqHeader('User-Agent'),
+                Accept: getReqHeader('Accept'),
+                'Accept-Language': getReqHeader('Accept-Language'),
+                'Accept-Encoding': getReqHeader('Accept-Encoding'),
+                Connection: 'keep-alive',
+                'Cache-Control': 'max-age=0',
+            },
+        };
+        setDockerAuthHeader(token_parameter.headers, env);
+        const token_url = auth_url + url.pathname + url.search;
+        return fetch(new Request(token_url, request), token_parameter);
+    }
+
+    if (hub_host == 'registry-1.docker.io' && /^\/v2\/[^/]+\/[^/]+\/[^/]+$/.test(url.pathname) && !/^\/v2\/library/.test(url.pathname)) {
+        url.pathname = '/v2/library/' + url.pathname.split('/v2/')[1];
+    }
+
+    if (
+        url.pathname.startsWith('/v2/') &&
+        (
+            url.pathname.includes('/manifests/') ||
+            url.pathname.includes('/blobs/') ||
+            url.pathname.includes('/tags/') ||
+            url.pathname.endsWith('/tags/list')
+        )
+    ) {
+        const v2Match = url.pathname.match(/^\/v2\/(.+?)(?:\/(manifests|blobs|tags)\/)/);
+        const repo = v2Match ? v2Match[1] : '';
+        if (repo) {
+            const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
+            const tokenHeaders = {
+                'User-Agent': getReqHeader('User-Agent'),
+                Accept: getReqHeader('Accept'),
+                'Accept-Language': getReqHeader('Accept-Language'),
+                'Accept-Encoding': getReqHeader('Accept-Encoding'),
+                Connection: 'keep-alive',
+                'Cache-Control': 'max-age=0',
+            };
+            setDockerAuthHeader(tokenHeaders, env);
+            const tokenRes = await fetch(tokenUrl, {
+                headers: tokenHeaders,
+            });
+            const tokenData = await tokenRes.json();
+            const dockerToken = tokenData.token;
+            const parameter = dockerRequestParameters(request, getReqHeader, {
+                Authorization: `Bearer ${dockerToken}`,
+            });
+            const original_response = await fetch(new Request(url, request), parameter);
+            return dockerResponse(request, original_response, workers_url, hub_host);
+        }
+    }
+
+    const parameter = dockerRequestParameters(request, getReqHeader);
+    if (request.headers.has('Authorization')) {
+        parameter.headers.Authorization = getReqHeader('Authorization');
+    }
+
+    const original_response = await fetch(new Request(url, request), parameter);
+    return dockerResponse(request, original_response, workers_url, hub_host);
+}
+
+function setDockerAuthHeader(headers, env) {
+    if (!env) return;
+    if (env.DOCKER_AUTH) {
+        headers.Authorization = `Basic ${env.DOCKER_AUTH}`;
+        return;
+    }
+
+    const dockerPassword = env.DOCKER_TOKEN || env.DOCKER_PASSWORD;
+    if (env.DOCKER_USERNAME && dockerPassword) {
+        headers.Authorization = `Basic ${btoa(`${env.DOCKER_USERNAME}:${dockerPassword}`)}`;
+    }
+}
+
+function dockerRequestParameters(request, getReqHeader, extraHeaders = {}) {
+    const headers = {
+        Host: hub_host,
+        'User-Agent': getReqHeader('User-Agent'),
+        Accept: getReqHeader('Accept'),
+        'Accept-Language': getReqHeader('Accept-Language'),
+        'Accept-Encoding': getReqHeader('Accept-Encoding'),
+        Connection: 'keep-alive',
+        'Cache-Control': 'max-age=0',
+        ...extraHeaders,
+    };
+
+    if (request.headers.has('X-Amz-Content-Sha256')) {
+        headers['X-Amz-Content-Sha256'] = getReqHeader('X-Amz-Content-Sha256');
+    }
+
+    return {
+        headers,
+        cacheTtl: 3600,
+    };
+}
+
+async function dockerResponse(request, original_response, workers_url, baseHost) {
+    const original_text = original_response.clone().body;
+    const response_headers = original_response.headers;
+    const new_response_headers = new Headers(response_headers);
+    const status = original_response.status;
+
+    if (new_response_headers.get('Www-Authenticate')) {
+        const re = new RegExp(auth_url, 'g');
+        new_response_headers.set('Www-Authenticate', response_headers.get('Www-Authenticate').replace(re, workers_url));
+    }
+
+    if (new_response_headers.get('Location')) {
+        return dockerHttpHandler(request, new_response_headers.get('Location'), baseHost);
+    }
+
+    return new Response(original_text, {
+        status,
+        headers: new_response_headers,
+    });
+}
+
+function dockerNewUrl(urlStr, base) {
+    try {
+        return new URL(urlStr, base);
+    } catch (err) {
+        return null;
+    }
+}
+
+function dockerHttpHandler(req, pathname, baseHost) {
+    const reqHdrRaw = req.headers;
+    if (req.method === 'OPTIONS' && reqHdrRaw.has('access-control-request-headers')) {
+        return new Response(null, PREFLIGHT_INIT);
+    }
+
+    const reqHdrNew = new Headers(reqHdrRaw);
+    reqHdrNew.delete('Authorization');
+
+    const urlObj = dockerNewUrl(pathname, 'https://' + baseHost);
+    const reqInit = {
+        method: req.method,
+        headers: reqHdrNew,
+        redirect: 'follow',
+        body: req.body,
+    };
+    return dockerProxy(urlObj, reqInit);
+}
+
+async function dockerProxy(urlObj, reqInit) {
+    const res = await fetch(urlObj.href, reqInit);
+    const resHdrNew = new Headers(res.headers);
+
+    resHdrNew.set('access-control-expose-headers', '*');
+    resHdrNew.set('access-control-allow-origin', '*');
+    resHdrNew.set('Cache-Control', 'max-age=1500');
+    resHdrNew.delete('content-security-policy');
+    resHdrNew.delete('content-security-policy-report-only');
+    resHdrNew.delete('clear-site-data');
+
+    return new Response(res.body, {
+        status: res.status,
+        headers: resHdrNew,
+    });
 }
 
 /**
