@@ -36,6 +36,9 @@ export default {
         if (url.pathname === dockerPrefix.slice(0, -1) || url.pathname.startsWith(dockerPrefix)) {
             return dockerFetchHandler(request, env, dockerPrefix).catch(err => makeRes('docker worker error:\n' + err.stack, 502))
         }
+        if (isDockerRegistryRequest(url)) {
+            return dockerFetchHandler(request, env).catch(err => makeRes('docker worker error:\n' + err.stack, 502))
+        }
         if (url.pathname.startsWith(PREFIX)) {
             return fetchHandler(request, env).catch(err => makeRes('cfworker error:\n' + err.stack, 502))
         } else if (url.pathname !== '/') {
@@ -201,6 +204,13 @@ function getDockerPrefix(env) {
     return prefix;
 }
 
+function isDockerRegistryRequest(url) {
+    return url.pathname === '/v2' ||
+        url.pathname.startsWith('/v2/') ||
+        (url.pathname === '/token' && url.searchParams.has('service')) ||
+        (url.pathname.startsWith('/token/') && url.searchParams.has('service'));
+}
+
 function routeByDockerHosts(host) {
     const routes = {
         quay: 'quay.io',
@@ -220,13 +230,13 @@ function routeByDockerHosts(host) {
 async function dockerFetchHandler(request, env, dockerPrefix) {
     const getReqHeader = key => request.headers.get(key);
     const originalUrl = new URL(request.url);
-    const prefixBase = dockerPrefix.slice(0, -1);
+    const prefixBase = dockerPrefix ? dockerPrefix.slice(0, -1) : '';
     const workers_url = `${originalUrl.origin}${prefixBase}`;
 
     let url = new URL(request.url);
-    if (url.pathname === prefixBase) {
+    if (prefixBase && url.pathname === prefixBase) {
         url.pathname = '/';
-    } else if (url.pathname.startsWith(dockerPrefix)) {
+    } else if (dockerPrefix && url.pathname.startsWith(dockerPrefix)) {
         url.pathname = '/' + url.pathname.slice(dockerPrefix.length);
     }
 
@@ -243,7 +253,14 @@ async function dockerFetchHandler(request, env, dockerPrefix) {
     }
 
     url.hostname = hub_host;
-    if (url.pathname === '/' || url.pathname.startsWith('/v1/')) {
+    if (url.pathname === '/') {
+        return new Response(await nginx(), {
+            headers: {
+                'Content-Type': 'text/html; charset=UTF-8',
+            },
+        });
+    }
+    if (url.pathname.startsWith('/v1/')) {
         return new Response('Docker registry proxy only', { status: 404 });
     }
 
